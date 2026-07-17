@@ -18,6 +18,12 @@
     --danger:#b5533c;
   }
   *{box-sizing:border-box;}
+  body.no-select, body.no-select *{
+    user-select:none;
+    -webkit-user-select:none;
+    -moz-user-select:none;
+    -ms-user-select:none;
+  }
   html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;}
   #app{display:flex;height:100vh;width:100vw;overflow:hidden;}
   #map{flex:1;background:#0b0b08;position:relative;cursor:crosshair;}
@@ -351,6 +357,8 @@
     <div class="list-wrap" id="listWrap">
       <div class="list-section-title">Markers</div>
       <div id="markerList"></div>
+      <div class="list-section-title">Areas</div>
+      <div id="areaList"></div>
       <div class="list-section-title">Routes</div>
       <div id="routeList"></div>
       <div class="list-section-title">Drawings</div>
@@ -473,7 +481,7 @@ async function loadDefaultSeed(){
 }
 
 async function saveData(){
-  const payload = JSON.stringify({markers, routes, pens});
+  const payload = JSON.stringify({markers, routes, pens, areas});
   try{
     if(window.storage){
       await window.storage.set(STORE_KEY, payload, false);
@@ -500,6 +508,7 @@ const CATEGORIES = [
 let markers = [];   // {id, lat, lng, name, desc, cat}
 let routes = [];    // {id, points:[[lat,lng],...], name, color}
 let pens = [];       // {id, points:[[lat,lng],...], color, width}
+let areas = [];      // {id, points:[[lat,lng],...], name, desc, cat} -- large-area POIs (converted from pen strokes)
 let nextId = 1;
 let mode = "pan";
 let drawingPoints = [];
@@ -507,6 +516,8 @@ let drawingLine = null;
 let drawingMarkers = [];
 let pendingLatLng = null;
 let editingMarkerId = null;
+let editingAreaId = null;
+let convertingPenId = null;
 let selectedCat = CATEGORIES[0].id;
 let selectedRouteColor = "#c9a227";
 let selectedPenColor = "#e0e0e0";
@@ -517,6 +528,7 @@ let penStrokeLine = null;
 const leafletMarkers = {};
 const leafletRoutes = {};
 const leafletPens = {};
+const leafletAreas = {};
 
 // ---------- Map setup ----------
 const bounds = [[0,0],[IMG_HEIGHT, IMG_WIDTH]];
@@ -655,6 +667,20 @@ function renderPenOnMap(p){
   leafletPens[p.id] = line;
 }
 
+function renderAreaOnMap(a){
+  const color = catColor(a.cat);
+  const poly = L.polygon(a.points, {color:color, weight:2, fillColor:color, fillOpacity:0.22});
+  poly.bindPopup(`<div class="popup-title">${escapeHtml(a.name)}</div><div class="popup-desc">${escapeHtml(a.desc||"")}</div><div class="popup-desc" style="margin-top:4px;opacity:.7;">${catLabel(a.cat)}</div>`);
+  poly.bindTooltip(escapeHtml(a.name), {
+    permanent: true,
+    direction: 'center',
+    className: 'poi-label',
+    opacity: 0.95
+  });
+  poly.addTo(poiLayer); // grouped with POIs so Hide POIs / Hide Names affect it too
+  leafletAreas[a.id] = poly;
+}
+
 function escapeHtml(s){
   return (s||"").replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -671,6 +697,7 @@ function setMode(newMode){
   }
   if(mode === 'pen' && newMode !== 'pen'){
     map.dragging.enable();
+    document.body.classList.remove('no-select');
   }
   mode = newMode;
   modeButtons.forEach(b=> b.classList.toggle('active', b.dataset.mode === mode));
@@ -678,6 +705,7 @@ function setMode(newMode){
   penControls.classList.toggle('show', mode === 'pen');
   if(mode === 'pen'){
     map.dragging.disable(); // click-drag draws instead of panning
+    document.body.classList.add('no-select'); // stop text/page highlighting while dragging to draw
   }
   if(mode === 'pan') hint.textContent = 'Pan mode: drag to move, scroll to zoom, click a marker or route to view it.';
   if(mode === 'poi') hint.textContent = 'Click anywhere on the map to place a new marker.';
@@ -702,6 +730,7 @@ map.on('click', (e)=>{
 // ---------- Pen (freehand) drawing ----------
 map.on('mousedown', (e)=>{
   if(mode !== 'pen') return;
+  if(e.originalEvent) e.originalEvent.preventDefault(); // stop native text/page selection drag
   isPenDrawing = true;
   penStrokePoints = [[e.latlng.lat, e.latlng.lng]];
   penStrokeLine = L.polyline(penStrokePoints, {
@@ -785,6 +814,8 @@ CATEGORIES.forEach(c=>{
 catSwatches.children[0].classList.add('sel');
 
 function openPoiModal(existingMarker){
+  editingAreaId = null;
+  convertingPenId = null;
   const title = document.getElementById('poiModalTitle');
   const saveBtn = document.getElementById('poiSave');
   if(existingMarker){
@@ -808,14 +839,47 @@ function openPoiModal(existingMarker){
   poiModal.classList.add('show');
   setTimeout(()=>document.getElementById('poiName').focus(), 50);
 }
+
+function openAreaModal(existingArea){
+  editingMarkerId = null;
+  pendingLatLng = null;
+  const title = document.getElementById('poiModalTitle');
+  const saveBtn = document.getElementById('poiSave');
+  if(existingArea){
+    editingAreaId = existingArea.id;
+    convertingPenId = null;
+    title.textContent = 'Edit Area';
+    saveBtn.textContent = 'Save Changes';
+    document.getElementById('poiName').value = existingArea.name || '';
+    document.getElementById('poiDesc').value = existingArea.desc || '';
+    selectedCat = existingArea.cat;
+  } else {
+    // fresh conversion; convertingPenId must already be set by the caller
+    editingAreaId = null;
+    title.textContent = 'Convert to Area POI';
+    saveBtn.textContent = 'Create Area';
+    document.getElementById('poiName').value = '';
+    document.getElementById('poiDesc').value = '';
+    selectedCat = CATEGORIES[0].id;
+  }
+  document.querySelectorAll('#catSwatches .cat-swatch').forEach(s=>{
+    s.classList.toggle('sel', s.dataset.cat === selectedCat);
+  });
+  poiModal.classList.add('show');
+  setTimeout(()=>document.getElementById('poiName').focus(), 50);
+}
+
 document.getElementById('poiCancel').addEventListener('click', ()=>{
   poiModal.classList.remove('show');
   pendingLatLng = null;
   editingMarkerId = null;
+  editingAreaId = null;
+  convertingPenId = null;
 });
 document.getElementById('poiSave').addEventListener('click', ()=>{
-  const name = document.getElementById('poiName').value.trim() || 'Unnamed Marker';
+  const name = document.getElementById('poiName').value.trim() || 'Unnamed';
   const desc = document.getElementById('poiDesc').value.trim();
+
   if(editingMarkerId){
     const m = markers.find(x=>x.id === editingMarkerId);
     if(m){
@@ -823,6 +887,29 @@ document.getElementById('poiSave').addEventListener('click', ()=>{
       poiLayer.removeLayer(leafletMarkers[m.id]);
       delete leafletMarkers[m.id];
       renderMarkerOnMap(m);
+      refreshLists();
+      saveData();
+    }
+  } else if(editingAreaId){
+    const a = areas.find(x=>x.id === editingAreaId);
+    if(a){
+      a.name = name; a.desc = desc; a.cat = selectedCat;
+      poiLayer.removeLayer(leafletAreas[a.id]);
+      delete leafletAreas[a.id];
+      renderAreaOnMap(a);
+      refreshLists();
+      saveData();
+    }
+  } else if(convertingPenId){
+    const p = pens.find(x=>x.id === convertingPenId);
+    if(p){
+      const a = {id: 'a'+(nextId++), points: p.points.slice(), name, desc, cat: selectedCat};
+      areas.push(a);
+      renderAreaOnMap(a);
+      // remove the original freehand stroke now that it's an area
+      map.removeLayer(leafletPens[p.id]);
+      delete leafletPens[p.id];
+      pens = pens.filter(x=>x.id !== p.id);
       refreshLists();
       saveData();
     }
@@ -834,9 +921,12 @@ document.getElementById('poiSave').addEventListener('click', ()=>{
     refreshLists();
     saveData();
   }
+
   poiModal.classList.remove('show');
   pendingLatLng = null;
   editingMarkerId = null;
+  editingAreaId = null;
+  convertingPenId = null;
 });
 
 // ---------- Route modal ----------
@@ -903,6 +993,7 @@ document.querySelector('#penWidths .width-btn[data-w="4"]').classList.add('sel')
 
 // ---------- Lists ----------
 const markerListEl = document.getElementById('markerList');
+const areaListEl = document.getElementById('areaList');
 const routeListEl = document.getElementById('routeList');
 const drawingListEl = document.getElementById('drawingList');
 const countLabel = document.getElementById('countLabel');
@@ -940,6 +1031,37 @@ function refreshLists(){
     markerListEl.appendChild(item);
   });
 
+  areaListEl.innerHTML = '';
+  if(areas.length === 0){
+    areaListEl.innerHTML = '<div class="empty-note">No area POIs yet</div>';
+  }
+  areas.forEach(a=>{
+    const item = document.createElement('div');
+    item.className = 'item';
+    item.innerHTML = `<div class="dot" style="background:${catColor(a.cat)}"></div>
+      <div class="info"><div class="name">${escapeHtml(a.name)}</div><div class="sub">${catLabel(a.cat)}</div></div>
+      <button class="edit" title="Edit">✎</button>
+      <button class="del" title="Delete">✕</button>`;
+    item.addEventListener('click', (e)=>{
+      if(e.target.classList.contains('del') || e.target.classList.contains('edit')) return;
+      map.fitBounds(leafletAreas[a.id].getBounds(), {padding:[40,40]});
+      leafletAreas[a.id].openPopup();
+    });
+    item.querySelector('.edit').addEventListener('click', (e)=>{
+      e.stopPropagation();
+      openAreaModal(a);
+    });
+    item.querySelector('.del').addEventListener('click', (e)=>{
+      e.stopPropagation();
+      poiLayer.removeLayer(leafletAreas[a.id]);
+      delete leafletAreas[a.id];
+      areas = areas.filter(x=>x.id !== a.id);
+      refreshLists();
+      saveData();
+    });
+    areaListEl.appendChild(item);
+  });
+
   routeListEl.innerHTML = '';
   if(routes.length === 0){
     routeListEl.innerHTML = '<div class="empty-note">No routes yet</div>';
@@ -974,12 +1096,20 @@ function refreshLists(){
     item.className = 'item';
     item.innerHTML = `<div class="dot" style="background:${p.color}"></div>
       <div class="info"><div class="name">Stroke ${idx+1}</div><div class="sub">${p.points.length} points · width ${p.width}</div></div>
+      <button class="edit" title="Convert to Area POI">⬛</button>
       <button class="del" title="Delete">✕</button>`;
     item.addEventListener('click', (e)=>{
-      if(e.target.classList.contains('del')) return;
+      if(e.target.classList.contains('del') || e.target.classList.contains('edit')) return;
       map.fitBounds(leafletPens[p.id].getBounds(), {padding:[40,40]});
     });
-    item.querySelector('.del').addEventListener('click', ()=>{
+    item.querySelector('.edit').addEventListener('click', (e)=>{
+      e.stopPropagation();
+      convertingPenId = p.id;
+      editingAreaId = null;
+      openAreaModal(null);
+    });
+    item.querySelector('.del').addEventListener('click', (e)=>{
+      e.stopPropagation();
       map.removeLayer(leafletPens[p.id]);
       delete leafletPens[p.id];
       pens = pens.filter(x=>x.id !== p.id);
@@ -989,18 +1119,21 @@ function refreshLists(){
     drawingListEl.appendChild(item);
   });
 
-  countLabel.textContent = `${markers.length} marker${markers.length!==1?'s':''} · ${routes.length} route${routes.length!==1?'s':''} · ${pens.length} drawing${pens.length!==1?'s':''}`;
+  countLabel.textContent = `${markers.length} marker${markers.length!==1?'s':''} · ${areas.length} area${areas.length!==1?'s':''} · ${routes.length} route${routes.length!==1?'s':''} · ${pens.length} drawing${pens.length!==1?'s':''}`;
 }
 
 document.getElementById('clearAll').addEventListener('click', ()=>{
-  if(!confirm('Remove all markers, routes, and pen drawings?')) return;
+  if(!confirm('Remove all markers, areas, routes, and pen drawings?')) return;
   Object.values(leafletMarkers).forEach(m=>poiLayer.removeLayer(m));
+  Object.values(leafletAreas).forEach(a=>poiLayer.removeLayer(a));
   Object.values(leafletRoutes).forEach(r=>map.removeLayer(r));
   Object.values(leafletPens).forEach(p=>map.removeLayer(p));
   for(const k in leafletMarkers) delete leafletMarkers[k];
+  for(const k in leafletAreas) delete leafletAreas[k];
   for(const k in leafletRoutes) delete leafletRoutes[k];
   for(const k in leafletPens) delete leafletPens[k];
   markers = [];
+  areas = [];
   routes = [];
   pens = [];
   refreshLists();
@@ -1014,7 +1147,8 @@ document.getElementById('exportBtn').addEventListener('click', ()=>{
     map: "S80",
     markers,
     routes,
-    pens
+    pens,
+    areas
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
   const url = URL.createObjectURL(blob);
@@ -1046,23 +1180,27 @@ importFileInput.addEventListener('change', (e)=>{
     const incomingMarkers = Array.isArray(data.markers) ? data.markers : [];
     const incomingRoutes = Array.isArray(data.routes) ? data.routes : [];
     const incomingPens = Array.isArray(data.pens) ? data.pens : [];
-    if(incomingMarkers.length === 0 && incomingRoutes.length === 0 && incomingPens.length === 0){
-      alert('No markers, routes, or drawings found in that file.');
+    const incomingAreas = Array.isArray(data.areas) ? data.areas : [];
+    if(incomingMarkers.length === 0 && incomingRoutes.length === 0 && incomingPens.length === 0 && incomingAreas.length === 0){
+      alert('No markers, areas, routes, or drawings found in that file.');
       importFileInput.value = '';
       return;
     }
     const replace = confirm(
-      `Found ${incomingMarkers.length} marker(s), ${incomingRoutes.length} route(s), and ${incomingPens.length} drawing(s).\n\n` +
+      `Found ${incomingMarkers.length} marker(s), ${incomingAreas.length} area(s), ${incomingRoutes.length} route(s), and ${incomingPens.length} drawing(s).\n\n` +
       `Click OK to REPLACE your current data, or Cancel to MERGE it with what's already on the map.`
     );
     if(replace){
       Object.values(leafletMarkers).forEach(m=>poiLayer.removeLayer(m));
+      Object.values(leafletAreas).forEach(a=>poiLayer.removeLayer(a));
       Object.values(leafletRoutes).forEach(r=>map.removeLayer(r));
       Object.values(leafletPens).forEach(p=>map.removeLayer(p));
       for(const k in leafletMarkers) delete leafletMarkers[k];
+      for(const k in leafletAreas) delete leafletAreas[k];
       for(const k in leafletRoutes) delete leafletRoutes[k];
       for(const k in leafletPens) delete leafletPens[k];
       markers = [];
+      areas = [];
       routes = [];
       pens = [];
     }
@@ -1071,6 +1209,11 @@ importFileInput.addEventListener('change', (e)=>{
       const nm = {...m, id: 'm'+(nextId++)};
       markers.push(nm);
       renderMarkerOnMap(nm);
+    });
+    incomingAreas.forEach(a=>{
+      const na = {...a, id: 'a'+(nextId++)};
+      areas.push(na);
+      renderAreaOnMap(na);
     });
     incomingRoutes.forEach(r=>{
       const nr = {...r, id: 'r'+(nextId++)};
@@ -1098,17 +1241,19 @@ importFileInput.addEventListener('change', (e)=>{
     data = await loadDefaultSeed();
     seeded = true;
   }
-  if(!data) data = {markers:[], routes:[], pens:[]};
+  if(!data) data = {markers:[], routes:[], pens:[], areas:[]};
   markers = data.markers || [];
   routes = data.routes || [];
   pens = data.pens || [];
+  areas = data.areas || [];
   let maxNum = 0;
-  [...markers, ...routes, ...pens].forEach(x=>{
+  [...markers, ...routes, ...pens, ...areas].forEach(x=>{
     const n = parseInt((x.id||'').replace(/\D/g,''), 10);
     if(!isNaN(n)) maxNum = Math.max(maxNum, n);
   });
   nextId = maxNum + 1;
   markers.forEach(renderMarkerOnMap);
+  areas.forEach(renderAreaOnMap);
   routes.forEach(renderRouteOnMap);
   pens.forEach(renderPenOnMap);
   refreshLists();
