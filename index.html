@@ -116,6 +116,24 @@
     flex-shrink:0;
   }
   .map-toggle-btn.off .dot{background:var(--muted);}
+
+  #mapButtonsLeft{
+    position:absolute;
+    bottom:12px;
+    left:12px;
+    z-index:1000;
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+    align-items:flex-start;
+  }
+  .map-toggle-btn.active{
+    background:var(--accent);
+    color:#211f14;
+    border-color:var(--accent);
+    font-weight:700;
+  }
+  .map-toggle-btn.active .dot{background:#211f14;}
   #sidebar{
     width:320px;
     background:var(--panel);
@@ -317,6 +335,9 @@
       <button class="map-toggle-btn" id="labelToggleBtn"><span class="dot"></span><span id="labelToggleLabel">Hide Names</span></button>
       <button class="map-toggle-btn" id="poiToggleBtn"><span class="dot"></span><span id="poiToggleLabel">Hide POIs</span></button>
     </div>
+    <div id="mapButtonsLeft">
+      <button class="map-toggle-btn" id="circleToolBtn"><span class="dot"></span><span>○ Circle POI</span></button>
+    </div>
   </div>
   <div id="sidebar">
     <div class="sb-header">
@@ -359,6 +380,8 @@
       <div id="markerList"></div>
       <div class="list-section-title">Areas</div>
       <div id="areaList"></div>
+      <div class="list-section-title">Circles</div>
+      <div id="circleList"></div>
       <div class="list-section-title">Routes</div>
       <div id="routeList"></div>
       <div class="list-section-title">Drawings</div>
@@ -428,6 +451,13 @@ const COL_LETTERS = "ABCDEFGHIJKLMNOPQRSTU";
 // Each grid box is subdivided into a 3x3 keypad: 1-2-3 top row, 4-5-6 middle, 7-8-9 bottom
 const KEYPAD = [[1,2,3],[4,5,6],[7,8,9]];
 
+// Straight-line distance between two L.LatLng points in our flat (CRS.Simple)
+// coordinate space. L.LatLng.distanceTo() assumes a spherical earth and
+// would give wrong results here, since lat/lng are really just pixel x/y.
+function planarDistance(a, b){
+  return Math.hypot(a.lat - b.lat, a.lng - b.lng);
+}
+
 function pixelToGridLabel(px, py){
   const relX = px - GRID_ORIGIN_X;
   const relY = py - GRID_ORIGIN_Y;
@@ -481,7 +511,7 @@ async function loadDefaultSeed(){
 }
 
 async function saveData(){
-  const payload = JSON.stringify({markers, routes, pens, areas});
+  const payload = JSON.stringify({markers, routes, pens, areas, circles});
   try{
     if(window.storage){
       await window.storage.set(STORE_KEY, payload, false);
@@ -509,6 +539,7 @@ let markers = [];   // {id, lat, lng, name, desc, cat}
 let routes = [];    // {id, points:[[lat,lng],...], name, color}
 let pens = [];       // {id, points:[[lat,lng],...], color, width}
 let areas = [];      // {id, points:[[lat,lng],...], name, desc, cat} -- large-area POIs (converted from pen strokes)
+let circles = [];    // {id, lat, lng, radius, name, desc, cat} -- circular area POIs
 let nextId = 1;
 let mode = "pan";
 let drawingPoints = [];
@@ -518,6 +549,11 @@ let pendingLatLng = null;
 let editingMarkerId = null;
 let editingAreaId = null;
 let convertingPenId = null;
+let editingCircleId = null;
+let circleOrigin = null;         // LatLng of the circle's center once placed, while sizing
+let circlePreview = null;        // live preview layer while sizing
+let creatingCircleCenter = null; // finalized center, waiting on the modal
+let creatingCircleRadius = 0;    // finalized radius, waiting on the modal
 let selectedCat = CATEGORIES[0].id;
 let selectedRouteColor = "#c9a227";
 let selectedPenColor = "#e0e0e0";
@@ -529,6 +565,7 @@ const leafletMarkers = {};
 const leafletRoutes = {};
 const leafletPens = {};
 const leafletAreas = {};
+const leafletCircles = {};
 
 // ---------- Map setup ----------
 const bounds = [[0,0],[IMG_HEIGHT, IMG_WIDTH]];
@@ -612,7 +649,8 @@ let poisVisible = true;
 
 const poiToggleBtn = document.getElementById('poiToggleBtn');
 const poiToggleLabel = document.getElementById('poiToggleLabel');
-poiToggleBtn.addEventListener('click', ()=>{
+poiToggleBtn.addEventListener('click', (e)=>{
+  e.stopPropagation();
   poisVisible = !poisVisible;
   if(poisVisible){
     poiLayer.addTo(map);
@@ -628,7 +666,8 @@ poiToggleBtn.addEventListener('click', ()=>{
 let labelsVisible = true;
 const labelToggleBtn = document.getElementById('labelToggleBtn');
 const labelToggleLabel = document.getElementById('labelToggleLabel');
-labelToggleBtn.addEventListener('click', ()=>{
+labelToggleBtn.addEventListener('click', (e)=>{
+  e.stopPropagation();
   labelsVisible = !labelsVisible;
   map.getContainer().classList.toggle('hide-labels', !labelsVisible);
   labelToggleBtn.classList.toggle('off', !labelsVisible);
@@ -681,6 +720,20 @@ function renderAreaOnMap(a){
   leafletAreas[a.id] = poly;
 }
 
+function renderCircleOnMap(c){
+  const color = catColor(c.cat);
+  const circ = L.circle([c.lat, c.lng], {radius:c.radius, color:color, weight:2, fillColor:color, fillOpacity:0.22});
+  circ.bindPopup(`<div class="popup-title">${escapeHtml(c.name)}</div><div class="popup-desc">${escapeHtml(c.desc||"")}</div><div class="popup-desc" style="margin-top:4px;opacity:.7;">${catLabel(c.cat)}</div>`);
+  circ.bindTooltip(escapeHtml(c.name), {
+    permanent: true,
+    direction: 'center',
+    className: 'poi-label',
+    opacity: 0.95
+  });
+  circ.addTo(poiLayer); // grouped with POIs so Hide POIs / Hide Names affect it too
+  leafletCircles[c.id] = circ;
+}
+
 function escapeHtml(s){
   return (s||"").replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -699,8 +752,12 @@ function setMode(newMode){
     map.dragging.enable();
     document.body.classList.remove('no-select');
   }
+  if(mode === 'circle' && newMode !== 'circle'){
+    cancelCircleDrawing();
+  }
   mode = newMode;
   modeButtons.forEach(b=> b.classList.toggle('active', b.dataset.mode === mode));
+  circleToolBtn.classList.toggle('active', mode === 'circle');
   routeControls.classList.toggle('show', mode === 'route');
   penControls.classList.toggle('show', mode === 'pen');
   if(mode === 'pen'){
@@ -711,8 +768,20 @@ function setMode(newMode){
   if(mode === 'poi') hint.textContent = 'Click anywhere on the map to place a new marker.';
   if(mode === 'route') hint.textContent = 'Click to add route points. Click "Finish Route" when done.';
   if(mode === 'pen') hint.textContent = 'Click and drag to draw freehand. Release to finish the stroke. Scroll still zooms.';
+  if(mode === 'circle') hint.textContent = 'Click to set the circle\'s center, move the mouse to resize, then click again to place it.';
 }
 modeButtons.forEach(b=> b.addEventListener('click', ()=> setMode(b.dataset.mode)));
+
+const circleToolBtn = document.getElementById('circleToolBtn');
+circleToolBtn.addEventListener('click', (e)=>{
+  e.stopPropagation();
+  setMode(mode === 'circle' ? 'pan' : 'circle');
+});
+
+function cancelCircleDrawing(){
+  if(circlePreview){ map.removeLayer(circlePreview); circlePreview = null; }
+  circleOrigin = null;
+}
 
 // ---------- Map click handling ----------
 map.on('click', (e)=>{
@@ -724,7 +793,30 @@ map.on('click', (e)=>{
     updateDrawingLine();
     const dm = L.circleMarker(e.latlng, {radius:4, color:selectedRouteColor, fillColor:selectedRouteColor, fillOpacity:1}).addTo(map);
     drawingMarkers.push(dm);
+  } else if(mode === 'circle'){
+    if(!circleOrigin){
+      // first click: set the center and start the live-resize preview
+      circleOrigin = e.latlng;
+      circlePreview = L.circle(circleOrigin, {
+        radius: 1, color:'#c9a227', weight:2, fillColor:'#c9a227', fillOpacity:0.15, dashArray:'6,6'
+      }).addTo(map);
+    } else {
+      // second click: lock in the radius and open the naming modal
+      const radius = planarDistance(circleOrigin, e.latlng);
+      creatingCircleCenter = circleOrigin;
+      creatingCircleRadius = Math.max(radius, 1);
+      if(circlePreview){ map.removeLayer(circlePreview); circlePreview = null; }
+      circleOrigin = null;
+      openCircleModal(null);
+    }
   }
+});
+
+// ---------- Circle POI live resize while placing ----------
+map.on('mousemove', (e)=>{
+  if(mode !== 'circle' || !circleOrigin || !circlePreview) return;
+  const radius = planarDistance(circleOrigin, e.latlng);
+  circlePreview.setRadius(Math.max(radius, 1));
 });
 
 // ---------- Pen (freehand) drawing ----------
@@ -816,6 +908,8 @@ catSwatches.children[0].classList.add('sel');
 function openPoiModal(existingMarker){
   editingAreaId = null;
   convertingPenId = null;
+  editingCircleId = null;
+  creatingCircleCenter = null;
   const title = document.getElementById('poiModalTitle');
   const saveBtn = document.getElementById('poiSave');
   if(existingMarker){
@@ -843,6 +937,8 @@ function openPoiModal(existingMarker){
 function openAreaModal(existingArea){
   editingMarkerId = null;
   pendingLatLng = null;
+  editingCircleId = null;
+  creatingCircleCenter = null;
   const title = document.getElementById('poiModalTitle');
   const saveBtn = document.getElementById('poiSave');
   if(existingArea){
@@ -869,12 +965,45 @@ function openAreaModal(existingArea){
   setTimeout(()=>document.getElementById('poiName').focus(), 50);
 }
 
+function openCircleModal(existingCircle){
+  editingMarkerId = null;
+  pendingLatLng = null;
+  editingAreaId = null;
+  convertingPenId = null;
+  const title = document.getElementById('poiModalTitle');
+  const saveBtn = document.getElementById('poiSave');
+  if(existingCircle){
+    editingCircleId = existingCircle.id;
+    creatingCircleCenter = null;
+    title.textContent = 'Edit Circle';
+    saveBtn.textContent = 'Save Changes';
+    document.getElementById('poiName').value = existingCircle.name || '';
+    document.getElementById('poiDesc').value = existingCircle.desc || '';
+    selectedCat = existingCircle.cat;
+  } else {
+    // fresh circle; creatingCircleCenter/Radius must already be set by the caller
+    editingCircleId = null;
+    title.textContent = 'New Circle POI';
+    saveBtn.textContent = 'Create Circle';
+    document.getElementById('poiName').value = '';
+    document.getElementById('poiDesc').value = '';
+    selectedCat = CATEGORIES[0].id;
+  }
+  document.querySelectorAll('#catSwatches .cat-swatch').forEach(s=>{
+    s.classList.toggle('sel', s.dataset.cat === selectedCat);
+  });
+  poiModal.classList.add('show');
+  setTimeout(()=>document.getElementById('poiName').focus(), 50);
+}
+
 document.getElementById('poiCancel').addEventListener('click', ()=>{
   poiModal.classList.remove('show');
   pendingLatLng = null;
   editingMarkerId = null;
   editingAreaId = null;
   convertingPenId = null;
+  editingCircleId = null;
+  creatingCircleCenter = null;
 });
 document.getElementById('poiSave').addEventListener('click', ()=>{
   const name = document.getElementById('poiName').value.trim() || 'Unnamed';
@@ -900,6 +1029,16 @@ document.getElementById('poiSave').addEventListener('click', ()=>{
       refreshLists();
       saveData();
     }
+  } else if(editingCircleId){
+    const c = circles.find(x=>x.id === editingCircleId);
+    if(c){
+      c.name = name; c.desc = desc; c.cat = selectedCat;
+      poiLayer.removeLayer(leafletCircles[c.id]);
+      delete leafletCircles[c.id];
+      renderCircleOnMap(c);
+      refreshLists();
+      saveData();
+    }
   } else if(convertingPenId){
     const p = pens.find(x=>x.id === convertingPenId);
     if(p){
@@ -913,6 +1052,17 @@ document.getElementById('poiSave').addEventListener('click', ()=>{
       refreshLists();
       saveData();
     }
+  } else if(creatingCircleCenter){
+    const c = {
+      id: 'c'+(nextId++),
+      lat: creatingCircleCenter.lat, lng: creatingCircleCenter.lng,
+      radius: creatingCircleRadius,
+      name, desc, cat: selectedCat
+    };
+    circles.push(c);
+    renderCircleOnMap(c);
+    refreshLists();
+    saveData();
   } else {
     if(!pendingLatLng) return;
     const m = {id: 'm'+(nextId++), lat: pendingLatLng.lat, lng: pendingLatLng.lng, name, desc, cat: selectedCat};
@@ -927,6 +1077,8 @@ document.getElementById('poiSave').addEventListener('click', ()=>{
   editingMarkerId = null;
   editingAreaId = null;
   convertingPenId = null;
+  editingCircleId = null;
+  creatingCircleCenter = null;
 });
 
 // ---------- Route modal ----------
@@ -994,6 +1146,7 @@ document.querySelector('#penWidths .width-btn[data-w="4"]').classList.add('sel')
 // ---------- Lists ----------
 const markerListEl = document.getElementById('markerList');
 const areaListEl = document.getElementById('areaList');
+const circleListEl = document.getElementById('circleList');
 const routeListEl = document.getElementById('routeList');
 const drawingListEl = document.getElementById('drawingList');
 const countLabel = document.getElementById('countLabel');
@@ -1062,6 +1215,37 @@ function refreshLists(){
     areaListEl.appendChild(item);
   });
 
+  circleListEl.innerHTML = '';
+  if(circles.length === 0){
+    circleListEl.innerHTML = '<div class="empty-note">No circle POIs yet</div>';
+  }
+  circles.forEach(c=>{
+    const item = document.createElement('div');
+    item.className = 'item';
+    item.innerHTML = `<div class="dot" style="background:${catColor(c.cat)}"></div>
+      <div class="info"><div class="name">${escapeHtml(c.name)}</div><div class="sub">${catLabel(c.cat)}</div></div>
+      <button class="edit" title="Edit">✎</button>
+      <button class="del" title="Delete">✕</button>`;
+    item.addEventListener('click', (e)=>{
+      if(e.target.classList.contains('del') || e.target.classList.contains('edit')) return;
+      map.fitBounds(leafletCircles[c.id].getBounds(), {padding:[40,40]});
+      leafletCircles[c.id].openPopup();
+    });
+    item.querySelector('.edit').addEventListener('click', (e)=>{
+      e.stopPropagation();
+      openCircleModal(c);
+    });
+    item.querySelector('.del').addEventListener('click', (e)=>{
+      e.stopPropagation();
+      poiLayer.removeLayer(leafletCircles[c.id]);
+      delete leafletCircles[c.id];
+      circles = circles.filter(x=>x.id !== c.id);
+      refreshLists();
+      saveData();
+    });
+    circleListEl.appendChild(item);
+  });
+
   routeListEl.innerHTML = '';
   if(routes.length === 0){
     routeListEl.innerHTML = '<div class="empty-note">No routes yet</div>';
@@ -1119,21 +1303,24 @@ function refreshLists(){
     drawingListEl.appendChild(item);
   });
 
-  countLabel.textContent = `${markers.length} marker${markers.length!==1?'s':''} · ${areas.length} area${areas.length!==1?'s':''} · ${routes.length} route${routes.length!==1?'s':''} · ${pens.length} drawing${pens.length!==1?'s':''}`;
+  countLabel.textContent = `${markers.length} marker${markers.length!==1?'s':''} · ${areas.length} area${areas.length!==1?'s':''} · ${circles.length} circle${circles.length!==1?'s':''} · ${routes.length} route${routes.length!==1?'s':''} · ${pens.length} drawing${pens.length!==1?'s':''}`;
 }
 
 document.getElementById('clearAll').addEventListener('click', ()=>{
-  if(!confirm('Remove all markers, areas, routes, and pen drawings?')) return;
+  if(!confirm('Remove all markers, areas, circles, routes, and pen drawings?')) return;
   Object.values(leafletMarkers).forEach(m=>poiLayer.removeLayer(m));
   Object.values(leafletAreas).forEach(a=>poiLayer.removeLayer(a));
+  Object.values(leafletCircles).forEach(c=>poiLayer.removeLayer(c));
   Object.values(leafletRoutes).forEach(r=>map.removeLayer(r));
   Object.values(leafletPens).forEach(p=>map.removeLayer(p));
   for(const k in leafletMarkers) delete leafletMarkers[k];
   for(const k in leafletAreas) delete leafletAreas[k];
+  for(const k in leafletCircles) delete leafletCircles[k];
   for(const k in leafletRoutes) delete leafletRoutes[k];
   for(const k in leafletPens) delete leafletPens[k];
   markers = [];
   areas = [];
+  circles = [];
   routes = [];
   pens = [];
   refreshLists();
@@ -1148,7 +1335,8 @@ document.getElementById('exportBtn').addEventListener('click', ()=>{
     markers,
     routes,
     pens,
-    areas
+    areas,
+    circles
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
   const url = URL.createObjectURL(blob);
@@ -1181,26 +1369,30 @@ importFileInput.addEventListener('change', (e)=>{
     const incomingRoutes = Array.isArray(data.routes) ? data.routes : [];
     const incomingPens = Array.isArray(data.pens) ? data.pens : [];
     const incomingAreas = Array.isArray(data.areas) ? data.areas : [];
-    if(incomingMarkers.length === 0 && incomingRoutes.length === 0 && incomingPens.length === 0 && incomingAreas.length === 0){
-      alert('No markers, areas, routes, or drawings found in that file.');
+    const incomingCircles = Array.isArray(data.circles) ? data.circles : [];
+    if(incomingMarkers.length === 0 && incomingRoutes.length === 0 && incomingPens.length === 0 && incomingAreas.length === 0 && incomingCircles.length === 0){
+      alert('No markers, areas, circles, routes, or drawings found in that file.');
       importFileInput.value = '';
       return;
     }
     const replace = confirm(
-      `Found ${incomingMarkers.length} marker(s), ${incomingAreas.length} area(s), ${incomingRoutes.length} route(s), and ${incomingPens.length} drawing(s).\n\n` +
+      `Found ${incomingMarkers.length} marker(s), ${incomingAreas.length} area(s), ${incomingCircles.length} circle(s), ${incomingRoutes.length} route(s), and ${incomingPens.length} drawing(s).\n\n` +
       `Click OK to REPLACE your current data, or Cancel to MERGE it with what's already on the map.`
     );
     if(replace){
       Object.values(leafletMarkers).forEach(m=>poiLayer.removeLayer(m));
       Object.values(leafletAreas).forEach(a=>poiLayer.removeLayer(a));
+      Object.values(leafletCircles).forEach(c=>poiLayer.removeLayer(c));
       Object.values(leafletRoutes).forEach(r=>map.removeLayer(r));
       Object.values(leafletPens).forEach(p=>map.removeLayer(p));
       for(const k in leafletMarkers) delete leafletMarkers[k];
       for(const k in leafletAreas) delete leafletAreas[k];
+      for(const k in leafletCircles) delete leafletCircles[k];
       for(const k in leafletRoutes) delete leafletRoutes[k];
       for(const k in leafletPens) delete leafletPens[k];
       markers = [];
       areas = [];
+      circles = [];
       routes = [];
       pens = [];
     }
@@ -1214,6 +1406,11 @@ importFileInput.addEventListener('change', (e)=>{
       const na = {...a, id: 'a'+(nextId++)};
       areas.push(na);
       renderAreaOnMap(na);
+    });
+    incomingCircles.forEach(c=>{
+      const nc = {...c, id: 'c'+(nextId++)};
+      circles.push(nc);
+      renderCircleOnMap(nc);
     });
     incomingRoutes.forEach(r=>{
       const nr = {...r, id: 'r'+(nextId++)};
@@ -1241,19 +1438,21 @@ importFileInput.addEventListener('change', (e)=>{
     data = await loadDefaultSeed();
     seeded = true;
   }
-  if(!data) data = {markers:[], routes:[], pens:[], areas:[]};
+  if(!data) data = {markers:[], routes:[], pens:[], areas:[], circles:[]};
   markers = data.markers || [];
   routes = data.routes || [];
   pens = data.pens || [];
   areas = data.areas || [];
+  circles = data.circles || [];
   let maxNum = 0;
-  [...markers, ...routes, ...pens, ...areas].forEach(x=>{
+  [...markers, ...routes, ...pens, ...areas, ...circles].forEach(x=>{
     const n = parseInt((x.id||'').replace(/\D/g,''), 10);
     if(!isNaN(n)) maxNum = Math.max(maxNum, n);
   });
   nextId = maxNum + 1;
   markers.forEach(renderMarkerOnMap);
   areas.forEach(renderAreaOnMap);
+  circles.forEach(renderCircleOnMap);
   routes.forEach(renderRouteOnMap);
   pens.forEach(renderPenOnMap);
   refreshLists();
